@@ -1,581 +1,614 @@
-import os
-import sys
-import json
-import uuid
-import datetime
 import tkinter as tk
-from tkinter import ttk, messagebox
-
-import requests  # for IP check
-
+from tkinter import messagebox
+import os, json, socket, subprocess, re, shutil
 
 # =========================================================
-#  INSTALL PATH (FROM ARGS OR SELF)
+#  PATHS
 # =========================================================
-def get_install_path():
-    if "--install-path" in sys.argv:
-        try:
-            idx = sys.argv.index("--install-path")
-            return sys.argv[idx + 1]
-        except (ValueError, IndexError):
-            pass
-    return os.path.dirname(os.path.abspath(__file__))
 
+BASE = os.path.abspath(os.path.dirname(__file__))
 
-BASE_DIR = get_install_path()
-ACCOUNT_DIR = os.path.join(BASE_DIR, "account")
-MAIL_PATH = os.path.join(ACCOUNT_DIR, "mail.json")
-IDENTITY_PATH = os.path.join(ACCOUNT_DIR, "identity.json")
+DATA_DIR = os.path.join(BASE, "data")
+MAIL_DIR = os.path.join(BASE, "mail")
 
-os.makedirs(ACCOUNT_DIR, exist_ok=True)
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
+OUTBOX_FILE = os.path.join(DATA_DIR, "outbox.json")
 
+# Ensure folders exist
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(MAIL_DIR, exist_ok=True)
 
 # =========================================================
-#  DEVICE / IP HELPERS
+#  AUTO-DETECT WIFI IP
 # =========================================================
-def get_device_id():
-    # Simple device ID based on MAC
-    return hex(uuid.getnode())
 
-
-def get_ip():
+def get_wifi_ip():
     try:
-        return requests.get("https://api.ipify.org", timeout=3).text.strip()
-    except Exception:
-        return "unknown"
+        output = subprocess.check_output("ipconfig", shell=True).decode(errors="ignore")
+        sections = output.split("\r\n\r\n")
 
+        for sec in sections:
+            if ("Wireless LAN adapter" in sec) or ("Wi-Fi" in sec) or ("WLAN" in sec):
+                match = re.search(r"IPv4 Address[^\:]*:\s*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", sec)
+                if match:
+                    return match.group(1)
+
+        return "127.0.0.1"
+    except:
+        return "127.0.0.1"
 
 # =========================================================
-#  MAIL SYSTEM
+#  SETTINGS
 # =========================================================
-def add_mail(msg_type, title, message, extra=None):
-    if os.path.exists(MAIL_PATH):
-        with open(MAIL_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        data = []
 
-    entry = {
-        "type": msg_type,
-        "title": title,
-        "message": message,
-        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "read": False
+def load_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return {
+            "theme": "dark",
+            "account": {
+                "logged_in": False,
+                "username": "",
+                "email": ""
+            },
+            "mail_server_ip": get_wifi_ip()
+        }
+
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = f.read().strip()
+            if data == "":
+                raise Exception("Empty settings")
+
+            settings = json.loads(data)
+
+        if "mail_server_ip" not in settings:
+            settings["mail_server_ip"] = get_wifi_ip()
+
+        return settings
+
+    except:
+        defaults = {
+            "theme": "dark",
+            "account": {
+                "logged_in": False,
+                "username": "",
+                "email": ""
+            },
+            "mail_server_ip": get_wifi_ip()
+        }
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(defaults, f, indent=4)
+        return defaults
+
+def save_settings():
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=4)
+
+settings = load_settings()
+
+# =========================================================
+#  ACCOUNTS.JSON SYSTEM
+# =========================================================
+
+def load_accounts():
+    if not os.path.exists(ACCOUNTS_FILE):
+        return {}
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = f.read().strip()
+            if data == "":
+                return {}
+            return json.loads(data)
+    except:
+        return {}
+
+def save_accounts(accounts):
+    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, indent=4)
+
+def signup(email, password):
+    accounts = load_accounts()
+
+    if email in accounts:
+        return False, "Account already exists."
+
+    device = socket.gethostname()
+    ip = socket.gethostbyname(socket.gethostname())
+
+    accounts[email] = {
+        "password": password,
+        "device": device,
+        "ip": ip
     }
-    if extra:
-        entry.update(extra)
 
-    data.append(entry)
+    save_accounts(accounts)
+    return True, "Account created."
 
-    with open(MAIL_PATH, "w", encoding="utf-8") as f:
+def login(email, password):
+    accounts = load_accounts()
+
+    if email not in accounts:
+        return False, "Account does not exist."
+
+    acc = accounts[email]
+
+    if acc["password"] != password:
+        return False, "Incorrect password."
+
+    if acc["device"] != socket.gethostname():
+        return False, "Device mismatch."
+
+    if acc["ip"] != socket.gethostbyname(socket.gethostname()):
+        return False, "IP mismatch."
+
+    return True, "Login successful."
+
+def delete_account(email):
+    accounts = load_accounts()
+
+    if email not in accounts:
+        return False, "Account does not exist."
+
+    del accounts[email]
+    save_accounts(accounts)
+    return True, "Account deleted."
+
+# =========================================================
+#  OUTBOX
+# =========================================================
+
+def load_outbox():
+    if not os.path.exists(OUTBOX_FILE):
+        return []
+    with open(OUTBOX_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_outbox(data):
+    with open(OUTBOX_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
+# =========================================================
+#  MAIL
+# =========================================================
 
 def load_mail():
-    if not os.path.exists(MAIL_PATH):
-        return []
-    with open(MAIL_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_mail(data):
-    with open(MAIL_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
-
+    mails = []
+    for file in os.listdir(MAIL_DIR):
+        path = os.path.join(MAIL_DIR, file)
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                mails.append((os.path.splitext(file)[0], f.read()))
+    return mails
 
 # =========================================================
-#  IDENTITY / ACCOUNT
+#  THEME
 # =========================================================
-def load_identity():
-    if not os.path.exists(IDENTITY_PATH):
-        return None
-    with open(IDENTITY_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
 
+def apply_theme(theme):
+    global BG, FG, CARD, ACCENT
 
-def save_identity(email):
-    identity = {
-        "email": email,
-        "device_id": get_device_id(),
-        "signup_ip": get_ip(),
-        "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    }
-    with open(IDENTITY_PATH, "w", encoding="utf-8") as f:
-        json.dump(identity, f, indent=4)
-    return identity
+    if theme == "light":
+        BG = "#ffffff"
+        FG = "#000000"
+        CARD = "#f0f0f0"
+        ACCENT = "#3a86ff"
+    elif theme == "hacker":
+        BG = "#000000"
+        FG = "#00ff00"
+        CARD = "#001100"
+        ACCENT = "#00ff00"
+    else:
+        BG = "#1e1e1e"
+        FG = "#ffffff"
+        CARD = "#2b2b2b"
+        ACCENT = "#3a86ff"
 
-
-def security_check(identity):
-    if not identity:
-        return
-
-    current_device = get_device_id()
-    current_ip = get_ip()
-
-    # Device mismatch
-    if identity.get("device_id") != current_device:
-        add_mail(
-            "security",
-            "New Device Login Detected",
-            "Your account was accessed from a different device.",
-            {"device_id": current_device}
-        )
-
-    # IP mismatch
-    stored_ip = identity.get("signup_ip", "unknown")
-    if stored_ip != "unknown" and current_ip != "unknown" and stored_ip != current_ip:
-        add_mail(
-            "security",
-            "New IP Address Detected",
-            f"Your account was accessed from a new IP: {current_ip}",
-            {"ip": current_ip}
-        )
-
+apply_theme(settings["theme"])
 
 # =========================================================
-#  MAIN APP WINDOW
+#  UI
 # =========================================================
-class LeModCraftApp(tk.Tk):
+
+class Launcher(tk.Tk):
     def __init__(self):
         super().__init__()
-
-        self.title("LeModCraft")
+        self.title("LeModCraft Launcher")
         self.geometry("900x600")
-        self.minsize(800, 500)
+        self.configure(bg=BG)
 
-        # THEMES
-        self.themes = {
-            "dark": {
-                "bg": "#1e1e1e",
-                "sidebar": "#252526",
-                "top": "#333333",
-                "text": "#ffffff",
-                "accent": "#0e639c"
-            },
-            "light": {
-                "bg": "#f0f0f0",
-                "sidebar": "#dcdcdc",
-                "top": "#c8c8c8",
-                "text": "#000000",
-                "accent": "#0078d4"
-            },
-            "hacker": {
-                "bg": "#000000",
-                "sidebar": "#001100",
-                "top": "#002200",
-                "text": "#00ff00",
-                "accent": "#00aa00"
-            }
-        }
-        self.current_theme = "dark"
+        self.sidebar = tk.Frame(self, width=200, bg=CARD)
+        self.sidebar.pack(side="left", fill="y")
 
-        self.identity = load_identity()
-        security_check(self.identity)
+        self.page_frame = tk.Frame(self, bg=BG)
+        self.page_frame.pack(side="right", fill="both", expand=True)
 
         self.pages = {}
-        self.sidebar_buttons = {}
 
-        self.apply_theme()
-        self.create_topbar()
-        self.create_sidebar()
-        self.create_content()
-        self.load_pages()
+        self.build_sidebar()
+        self.build_pages()
         self.show_page("Home")
 
-    # ================= THEME =================
-    def apply_theme(self):
-        theme = self.themes[self.current_theme]
-        self.bg_dark = theme["bg"]
-        self.bg_sidebar = theme["sidebar"]
-        self.bg_top = theme["top"]
-        self.fg_text = theme["text"]
-        self.accent = theme["accent"]
-
-        self.configure(bg=self.bg_dark)
-
-        for page in getattr(self, "pages", {}).values():
-            try:
-                page.apply_theme()
-            except AttributeError:
-                pass
-
-        for btn in self.sidebar_buttons.values():
-            btn.configure(
-                bg=self.bg_sidebar,
-                fg=self.fg_text,
-                activebackground=self.accent,
-                activeforeground="white"
-            )
-
-        if hasattr(self, "topbar"):
-            self.topbar.configure(bg=self.bg_top)
-            for w in self.topbar.winfo_children():
-                try:
-                    w.configure(bg=self.bg_top, fg=self.fg_text)
-                except:
-                    pass
-
-    # ================= TOP BAR =================
-    def create_topbar(self):
-        self.topbar = tk.Frame(self, bg=self.bg_top, height=40)
-        self.topbar.pack(fill="x", side="top")
-
-        tk.Label(
-            self.topbar,
-            text="LeModCraft Launcher",
-            bg=self.bg_top,
-            fg=self.fg_text,
-            font=("Segoe UI", 14, "bold")
-        ).pack(side="left", padx=15)
-
-        self.account_label = tk.Label(
-            self.topbar,
-            text=self.get_account_label_text(),
-            bg=self.bg_top,
-            fg=self.fg_text,
-            font=("Segoe UI", 10)
-        )
-        self.account_label.pack(side="right", padx=15)
-
-    def get_account_label_text(self):
-        if self.identity:
-            return f"Logged in as {self.identity.get('email', 'Unknown')}"
-        return "Not logged in"
-
-    def update_account_label(self):
-        self.account_label.config(text=self.get_account_label_text())
-
-    # ================= SIDEBAR =================
-    def create_sidebar(self):
-        self.sidebar = tk.Frame(self, bg=self.bg_sidebar, width=180)
-        self.sidebar.pack(fill="y", side="left")
-
+    def build_sidebar(self):
         buttons = [
-            ("Home", "Home"),
-            ("Instances", "Instances"),
-            ("Versions", "Versions"),
-            ("Mods", "Mods"),
-            ("Mail", "Mail"),
-            ("Settings", "Settings"),
+            ("Home", lambda: self.show_page("Home")),
+            ("Instances", lambda: self.show_page("Instances")),
+            ("Versions", lambda: self.show_page("Versions")),
+            ("Mods", lambda: self.show_page("Mods")),
+            ("Mail", lambda: self.show_page("Mail")),
+            ("Settings", lambda: self.show_page("Settings")),
         ]
 
-        for text, page_name in buttons:
-            btn = tk.Button(
+        for text, cmd in buttons:
+            tk.Button(
                 self.sidebar,
                 text=text,
-                command=lambda n=page_name: self.show_page(n),
-                bg=self.bg_sidebar,
-                fg=self.fg_text,
-                activebackground=self.accent,
-                activeforeground="white",
-                bd=0,
-                font=("Segoe UI", 12),
-                pady=10
-            )
-            btn.pack(fill="x")
-            self.sidebar_buttons[page_name] = btn
+                bg=CARD,
+                fg=FG,
+                font=("Arial", 14),
+                relief="flat",
+                command=cmd
+            ).pack(fill="x", pady=5)
 
-    # ================= CONTENT =================
-    def create_content(self):
-        self.content = tk.Frame(self, bg=self.bg_dark)
-        self.content.pack(fill="both", expand=True, side="right")
+    def build_pages(self):
+        self.pages["Home"] = self.make_page("Home Page")
+        self.pages["Instances"] = self.make_page("Instances Page")
+        self.pages["Versions"] = self.make_page("Versions Page")
+        self.pages["Mods"] = self.make_page("Mods Page")
+        self.pages["Mail"] = self.build_mail_page()
+        self.pages["Settings"] = self.build_settings_page()
 
-    # ================= PAGES =================
-    def load_pages(self):
-        self.pages["Home"] = HomePage(self.content, self)
-        self.pages["Instances"] = InstancesPage(self.content, self)
-        self.pages["Versions"] = VersionsPage(self.content, self)
-        self.pages["Mods"] = ModsPage(self.content, self)
-        self.pages["Mail"] = MailPage(self.content, self)
-        self.pages["Settings"] = SettingsPage(self.content, self)
+    def make_page(self, text):
+        frame = tk.Frame(self.page_frame, bg=BG)
+        tk.Label(frame, text=text, font=("Arial", 24), bg=BG, fg=FG).pack(pady=20)
+        return frame
 
     def show_page(self, name):
+        if name == "Settings":
+            self.pages["Settings"] = self.build_settings_page()
         for page in self.pages.values():
             page.pack_forget()
         self.pages[name].pack(fill="both", expand=True)
 
-    # ================= ACCOUNT =================
-    def open_signup_window(self):
-        win = tk.Toplevel(self)
-        win.title("Sign Up / Log In")
-        win.geometry("320x260")
-        win.configure(bg=self.bg_dark)
+    # ---------------- MAIL PAGE ----------------
+    def build_mail_page(self):
+        frame = tk.Frame(self.page_frame, bg=BG)
 
-        tk.Label(win, text="Email:", bg=self.bg_dark, fg=self.fg_text).pack(pady=5)
-        email_entry = tk.Entry(win)
-        email_entry.pack()
-
-        tk.Label(win, text="Password:", bg=self.bg_dark, fg=self.fg_text).pack(pady=5)
-        password_entry = tk.Entry(win, show="*")
-        password_entry.pack()
-
-        def submit():
-            email = email_entry.get().strip()
-            pwd = password_entry.get().strip()
-            if not email or not pwd:
-                messagebox.showerror("Error", "Please enter email and password.")
-                return
-
-            self.identity = save_identity(email)
-            add_mail(
-                "system",
-                "Account Created",
-                "Your LeModCraft account has been created on this device."
-            )
-            self.update_account_label()
-            messagebox.showinfo("Success", "Account created and logged in.")
-            win.destroy()
+        tk.Label(frame, text="Mail", font=("Arial", 24, "bold"), bg=BG, fg=FG).pack(pady=20)
 
         tk.Button(
-            win,
-            text="Submit",
-            command=submit,
-            bg=self.bg_sidebar,
-            fg=self.fg_text
-        ).pack(pady=20)
-
-
-# =========================================================
-#  BASE PAGE
-# =========================================================
-class BasePage(tk.Frame):
-    def __init__(self, parent, app):
-        super().__init__(parent, bg=app.bg_dark)
-        self.app = app
-
-    def apply_theme(self):
-        self.configure(bg=self.app.bg_dark)
-        for w in self.winfo_children():
-            try:
-                if isinstance(w, tk.Label):
-                    w.configure(bg=self.app.bg_dark, fg=self.app.fg_text)
-                elif isinstance(w, tk.Button):
-                    w.configure(
-                        bg=self.app.bg_sidebar,
-                        fg=self.app.fg_text,
-                        activebackground=self.app.accent,
-                        activeforeground="white"
-                    )
-                elif isinstance(w, tk.Listbox):
-                    w.configure(
-                        bg=self.app.bg_sidebar,
-                        fg=self.app.fg_text
-                    )
-            except:
-                pass
-
-
-# =========================================================
-#  PAGES
-# =========================================================
-class HomePage(BasePage):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-        tk.Label(self, text="Home", font=("Segoe UI", 20)).pack(pady=20)
-        tk.Label(self, text="Welcome to LeModCraft Launcher.").pack(pady=5)
-
-
-class InstancesPage(BasePage):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-        tk.Label(self, text="Instances", font=("Segoe UI", 20)).pack(pady=20)
-        tk.Label(self, text="Instance management will go here.").pack(pady=5)
-
-
-class VersionsPage(BasePage):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-        tk.Label(self, text="Versions", font=("Segoe UI", 20)).pack(pady=20)
-        tk.Label(self, text="Version management will go here.").pack(pady=5)
-
-
-class ModsPage(BasePage):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-        tk.Label(self, text="Mods", font=("Segoe UI", 20)).pack(pady=20)
-        tk.Label(self, text="Mod browser / uploader will go here.").pack(pady=5)
-
-        tk.Label(
-            self,
-            text="Posting mods requires an account.",
-            font=("Segoe UI", 10)
+            frame,
+            text="New Mail",
+            bg=ACCENT,
+            fg="white",
+            command=lambda: open_mail_editor(self)
         ).pack(pady=10)
 
-        tk.Button(
-            self,
-            text="Post New Mod",
-            command=self.post_mod
-        ).pack(pady=5)
+        self.mail_list = tk.Frame(frame, bg=BG)
+        self.mail_list.pack(fill="both", expand=True, padx=20, pady=10)
 
-    def post_mod(self):
-        if not self.app.identity:
-            messagebox.showwarning(
-                "Account Required",
-                "You must create an account on this device to post mods."
-            )
+        self.refresh_mail()
+
+        return frame
+
+    def refresh_mail(self):
+        for widget in self.mail_list.winfo_children():
+            widget.destroy()
+
+        if not settings["account"]["logged_in"]:
+            tk.Label(self.mail_list, text="Log in to view mail.", bg=BG, fg=FG).pack()
             return
 
-        add_mail(
-            "system",
-            "Mod Submitted",
-            "Your mod has been submitted for review."
-        )
-        messagebox.showinfo("Submitted", "Your mod has been submitted (placeholder).")
+        mails = load_mail()
 
-
-class MailPage(BasePage):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-
-        tk.Label(self, text="Mail", font=("Segoe UI", 20)).pack(pady=20)
-
-        self.listbox = tk.Listbox(
-            self,
-            bg=self.app.bg_sidebar,
-            fg=self.app.fg_text,
-            font=("Segoe UI", 11),
-            height=15
-        )
-        self.listbox.pack(fill="both", expand=True, padx=20, pady=10)
-
-        btn_row = tk.Frame(self, bg=self.app.bg_dark)
-        btn_row.pack(pady=5)
-
-        tk.Button(
-            btn_row,
-            text="Refresh",
-            command=self.load_mail
-        ).pack(side="left", padx=5)
-
-        tk.Button(
-            btn_row,
-            text="View",
-            command=self.view_selected
-        ).pack(side="left", padx=5)
-
-        tk.Button(
-            btn_row,
-            text="Mark All Read",
-            command=self.mark_all_read
-        ).pack(side="left", padx=5)
-
-        self.load_mail()
-
-    def load_mail(self):
-        self.listbox.delete(0, tk.END)
-        self.mail_data = load_mail()
-        for i, msg in enumerate(reversed(self.mail_data)):
-            prefix = "[UNREAD] " if not msg.get("read", False) else ""
-            self.listbox.insert(
-                tk.END,
-                f"{prefix}{msg.get('title', 'No title')} - {msg.get('time', '')}"
-            )
-
-    def view_selected(self):
-        sel = self.listbox.curselection()
-        if not sel:
+        if not mails:
+            tk.Label(self.mail_list, text="No mail.", bg=BG, fg=FG).pack()
             return
-        index_from_end = sel[0]
-        real_index = len(self.mail_data) - 1 - index_from_end
-        msg = self.mail_data[real_index]
 
-        win = tk.Toplevel(self)
-        win.title(msg.get("title", "Message"))
-        win.geometry("400x300")
-        win.configure(bg=self.app.bg_dark)
+        for subject, body in mails:
+            item = tk.Frame(self.mail_list, bg=CARD, pady=10, padx=10)
+            item.pack(fill="x", pady=5)
 
-        tk.Label(
-            win,
-            text=msg.get("title", "Message"),
-            font=("Segoe UI", 14, "bold"),
-            bg=self.app.bg_dark,
-            fg=self.app.fg_text
-        ).pack(pady=10)
+            tk.Label(item, text=subject, font=("Arial", 16, "bold"), bg=CARD, fg=FG).pack(anchor="w")
+            tk.Label(item, text=body, font=("Arial", 12), bg=CARD, fg=FG, wraplength=600, justify="left").pack(anchor="w")
 
-        text = tk.Text(
-            win,
-            bg=self.app.bg_sidebar,
-            fg=self.app.fg_text,
-            wrap="word"
-        )
-        text.pack(fill="both", expand=True, padx=10, pady=10)
-        text.insert("1.0", msg.get("message", ""))
-        text.config(state="disabled")
-
-        msg["read"] = True
-        save_mail(self.mail_data)
-        self.load_mail()
-
-    def mark_all_read(self):
-        for msg in self.mail_data:
-            msg["read"] = True
-        save_mail(self.mail_data)
-        self.load_mail()
-
-
-class SettingsPage(BasePage):
-    def __init__(self, parent, app):
-        super().__init__(parent, app)
-
-        tk.Label(self, text="Settings", font=("Segoe UI", 20)).pack(pady=20)
+    # ---------------- SETTINGS PAGE ----------------
+    def build_settings_page(self):
+        frame = tk.Frame(self.page_frame, bg=BG)
 
         # THEME
-        tk.Label(self, text="Theme:", font=("Segoe UI", 14)).pack(pady=(10, 5))
+        theme_frame = tk.Frame(frame, bg=BG)
+        theme_frame.pack(anchor="w", padx=20, pady=20)
 
-        theme_var = tk.StringVar(value=app.current_theme)
+        tk.Label(theme_frame, text="Theme", font=("Arial", 18, "bold"), bg=BG, fg=FG).pack(anchor="w")
 
-        def change_theme():
-            app.current_theme = theme_var.get()
-            app.apply_theme()
+        theme_var = tk.StringVar(value=settings["theme"])
 
-        for theme in ["dark", "light", "hacker"]:
+        def save_theme():
+            settings["theme"] = theme_var.get()
+            save_settings()
+            apply_theme(settings["theme"])
+            apply_theme_live(self)
+
+        for t in ["dark", "light", "hacker"]:
             tk.Radiobutton(
-                self,
-                text=theme.capitalize(),
+                theme_frame,
+                text=t.capitalize(),
                 variable=theme_var,
-                value=theme,
-                command=change_theme,
-                bg=self.app.bg_dark,
-                fg=self.app.fg_text,
-                selectcolor=self.app.bg_sidebar,
-                font=("Segoe UI", 12)
-            ).pack(anchor="w", padx=40)
+                value=t,
+                bg=BG,
+                fg=FG,
+                selectcolor=BG,
+                command=save_theme
+            ).pack(anchor="w")
 
         # ACCOUNT
-        tk.Label(self, text="Account", font=("Segoe UI", 16)).pack(pady=(30, 10))
+        account_frame = tk.Frame(frame, bg=BG)
+        account_frame.pack(anchor="w", padx=20, pady=20)
 
-        self.status_label = tk.Label(
-            self,
-            text=self.get_status_text(),
-            font=("Segoe UI", 11)
-        )
-        self.status_label.pack(pady=5)
+        tk.Label(account_frame, text="Account", font=("Arial", 18, "bold"), bg=BG, fg=FG).pack(anchor="w")
 
-        tk.Button(
-            self,
-            text="Sign Up / Log In",
-            command=self.open_signup
-        ).pack(pady=10)
+        self.account_label = tk.Label(account_frame, text="", bg=BG, fg=FG, font=("Arial", 14))
+        self.account_label.pack(anchor="w", pady=5)
+
+        self.account_button = tk.Button(account_frame, text="", font=("Arial", 14), bg=ACCENT, fg="white")
+        self.account_button.pack(anchor="w", pady=5)
+
+        update_account_ui(self)
+
+        # DANGER ZONE
+        danger_frame = tk.Frame(frame, bg=BG)
+        danger_frame.pack(fill="x", padx=20, pady=40)
 
         tk.Label(
-            self,
-            text="Posting mods requires an account on this device.",
-            font=("Segoe UI", 9)
-        ).pack(pady=5)
+            danger_frame,
+            text="Danger Zone",
+            font=("Arial", 18, "bold"),
+            fg="#ff5555",
+            bg=BG
+        ).pack(anchor="w", pady=(0, 10))
 
-    def get_status_text(self):
-        if self.app.identity:
-            return f"Logged in as {self.app.identity.get('email', 'Unknown')}"
-        return "Not logged in"
+        tk.Button(
+            danger_frame,
+            text="Delete Account",
+            font=("Arial", 14),
+            bg="#ff4444",
+            fg="white",
+            activebackground="#cc0000",
+            command=lambda: try_delete_account(self)
+        ).pack(anchor="w")
 
-    def open_signup(self):
-        self.app.open_signup_window()
-        self.status_label.config(text=self.get_status_text())
-
+        return frame
 
 # =========================================================
-#  RUN
+#  MAIL EDITOR
 # =========================================================
+
+def open_mail_editor(app):
+    if not settings["account"]["logged_in"]:
+        messagebox.showerror("Error", "Log in first.")
+        return
+
+    win = tk.Toplevel(app)
+    win.title("New Mail")
+    win.geometry("400x400")
+    win.configure(bg=BG)
+
+    tk.Label(win, text="Subject:", bg=BG, fg=FG).pack(anchor="w", padx=20)
+    subject_entry = tk.Entry(win, width=40)
+    subject_entry.pack(padx=20, pady=5)
+
+    tk.Label(win, text="Message:", bg=BG, fg=FG).pack(anchor="w", padx=20)
+    body_text = tk.Text(win, width=40, height=15, bg=CARD, fg=FG)
+    body_text.pack(padx=20, pady=5)
+
+    def save_mail():
+        subject = subject_entry.get().strip()
+        body = body_text.get("1.0", "end").strip()
+
+        if not subject:
+            messagebox.showerror("Error", "Subject required.")
+            return
+
+        # Save locally
+        mail_path = os.path.join(MAIL_DIR, subject + ".txt")
+        with open(mail_path, "w", encoding="utf-8") as f:
+            f.write(body)
+
+        # TCP SEND
+        target_ip = settings.get("mail_server_ip", get_wifi_ip())
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect((target_ip, 50505))
+                payload = f"{subject}|{body}"
+                s.sendall(payload.encode("utf-8"))
+                s.recv(1024)
+        except:
+            out = load_outbox()
+            out.append({
+                "ip": target_ip,
+                "subject": subject,
+                "body": body
+            })
+            save_outbox(out)
+
+        win.destroy()
+        app.refresh_mail()
+
+    tk.Button(win, text="Save", bg=ACCENT, fg="white", command=save_mail).pack(pady=10)
+
+# =========================================================
+#  ACCOUNT UI
+# =========================================================
+
+def update_account_ui(app):
+    if settings["account"]["logged_in"]:
+        app.account_label.config(text=f"Logged in as: {settings['account']['username']}")
+        app.account_button.config(text="Log Out", command=lambda: logout(app))
+    else:
+        app.account_label.config(text="Not logged in")
+        app.account_button.config(text="Sign Up / Log In", command=lambda: open_login_window(app))
+
+def logout(app):
+    settings["account"] = {
+        "logged_in": False,
+        "username": "",
+        "email": ""
+    }
+    save_settings()
+    update_account_ui(app)
+    app.refresh_mail()
+    messagebox.showinfo("Logged Out", "You have been logged out.")
+
+def try_delete_account(app):
+    if not settings["account"]["logged_in"]:
+        messagebox.showerror("Error", "You must be logged in to delete your account.")
+        return
+    open_delete_account_window(app)
+
+# =========================================================
+#  LOGIN WINDOW
+# =========================================================
+
+def open_login_window(app):
+    win = tk.Toplevel(app)
+    win.title("Login")
+    win.geometry("350x350")
+    win.configure(bg=BG)
+
+    tk.Label(win, text="Email:", bg=BG, fg=FG).pack(anchor="w", padx=20)
+    email_entry = tk.Entry(win, width=35)
+    email_entry.pack(padx=20, pady=5)
+
+    tk.Label(win, text="Password:", bg=BG, fg=FG).pack(anchor="w", padx=20)
+    pass_entry = tk.Entry(win, width=35, show="*")
+    pass_entry.pack(padx=20, pady=5)
+
+    def do_login():
+        ok, msg = login(email_entry.get(), pass_entry.get())
+
+        if not ok:
+            messagebox.showerror("Error", msg)
+            return
+
+        settings["account"] = {
+            "logged_in": True,
+            "username": email_entry.get(),
+            "email": email_entry.get()
+        }
+        save_settings()
+        update_account_ui(app)
+        app.refresh_mail()
+        win.destroy()
+
+    tk.Button(win, text="Login", bg=ACCENT, fg="white", command=do_login).pack(pady=10)
+
+    tk.Button(
+        win,
+        text="Create Account",
+        bg=CARD,
+        fg=FG,
+        command=lambda: open_signup_window(app, win)
+    ).pack(pady=10)
+
+# =========================================================
+#  SIGNUP WINDOW
+# =========================================================
+
+def open_signup_window(app, login_window=None):
+    if login_window:
+        login_window.destroy()
+
+    win = tk.Toplevel(app)
+    win.title("Create Account")
+    win.geometry("350x350")
+    win.configure(bg=BG)
+
+    tk.Label(win, text="Email:", bg=BG, fg=FG).pack(anchor="w", padx=20)
+    email_entry = tk.Entry(win, width=35)
+    email_entry.pack(padx=20, pady=5)
+
+    tk.Label(win, text="Password:", bg=BG, fg=FG).pack(anchor="w", padx=20)
+    pass_entry = tk.Entry(win, width=35, show="*")
+    pass_entry.pack(padx=20, pady=5)
+
+    def do_signup():
+        ok, msg = signup(email_entry.get(), pass_entry.get())
+
+        if not ok:
+            messagebox.showerror("Error", msg)
+            return
+
+        settings["account"] = {
+            "logged_in": True,
+            "username": email_entry.get(),
+            "email": email_entry.get()
+        }
+        save_settings()
+        update_account_ui(app)
+        app.refresh_mail()
+
+        messagebox.showinfo("Success", "Account created and logged in!")
+        win.destroy()
+
+    tk.Button(win, text="Sign Up", bg=ACCENT, fg="white", command=do_signup).pack(pady=20)
+
+# =========================================================
+#  DELETE ACCOUNT WINDOW
+# =========================================================
+
+def open_delete_account_window(app):
+    win = tk.Toplevel(app)
+    win.title("Delete Account")
+    win.geometry("400x250")
+    win.configure(bg=BG)
+
+    tk.Label(win, text="Delete Your Account", font=("Arial", 18, "bold"), fg=FG, bg=BG).pack(pady=10)
+
+    tk.Label(win, text="Email:", fg=FG, bg=BG).pack(anchor="w", padx=20)
+    email_entry = tk.Entry(win, width=40)
+    email_entry.pack(padx=20, pady=5)
+    email_entry.insert(0, settings["account"]["email"])
+    email_entry.config(state="disabled")
+
+    tk.Label(win, text="Password:", fg=FG, bg=BG).pack(anchor="w", padx=20)
+    pass_entry = tk.Entry(win, width=40, show="*")
+    pass_entry.pack(padx=20, pady=5)
+
+    tk.Button(
+        win,
+        text="Delete Account",
+        bg="#ff4444",
+        fg="white",
+        command=lambda: finalize_account_deletion(app, settings["account"]["email"], pass_entry.get(), win)
+    ).pack(pady=20)
+
+def finalize_account_deletion(app, email, password, window):
+    ok, msg = login(email, password)
+
+    if not ok:
+        messagebox.showerror("Error", "Password incorrect.")
+        return
+
+    delete_account(email)
+
+    settings["account"] = {
+        "logged_in": False,
+        "username": "",
+        "email": ""
+    }
+    save_settings()
+    update_account_ui(app)
+    app.refresh_mail()
+
+    messagebox.showinfo("Account Deleted", "Your account has been permanently deleted.")
+    window.destroy()
+
+# =========================================================
+#  RUN LAUNCHER
+# =========================================================
+
 if __name__ == "__main__":
-    app = LeModCraftApp()
+    app = Launcher()
     app.mainloop()
